@@ -1,0 +1,6 @@
+services:
+  - name: examen-backend
+    type: web
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app

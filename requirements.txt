@@ -1,0 +1,8 @@
+flask
+pytesseract
+pillow
+pdfplumber
+python-docx
+pandas
+openpyxl
+gunicorn

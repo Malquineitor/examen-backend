@@ -1,97 +1,247 @@
+"""
+Backend para procesamiento de documentos
+Soporta TODOS los formatos mediante conversión a PDF: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX, ODT, RTF, CSV, TXT, imágenes, etc.
+"""
 from flask import Flask, request, jsonify
-import tempfile
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
 import os
-import pytesseract
-from PIL import Image
-import docx
-import pandas as pd
-import pdfplumber
+import tempfile
+import logging
+from document_processor import DocumentProcessor
+from pdf_converter import PDFConverter
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)  # Habilitar CORS para todas las rutas
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB máximo
 
-@app.route("/procesar", methods=["POST"])
-def procesar():
-    if "file" not in request.files:
-        return jsonify({"error": "No se envió archivo"}), 400
+# Inicializar el procesador de documentos
+processor = DocumentProcessor()
 
-    archivo = request.files["file"]
+# Inicializar el convertidor de PDF
+pdf_converter = PDFConverter()
 
-    # Guardar archivo temporal
-    temp = tempfile.NamedTemporaryFile(delete=False)
-    archivo.save(temp.name)
-
-    nombre = (archivo.filename or "").lower()
-
+@app.route('/procesar', methods=['POST'])
+def procesar_documento():
+    """
+    Endpoint para procesar documentos
+    Acepta multipart/form-data con campo 'file'
+    Devuelve JSON: {"texto": "contenido extraído", "caracteres": int, "paginas": int, "method": str, "warnings": []}
+    """
     try:
-        if nombre.endswith(".pdf"):
-            texto = leer_pdf(temp.name)
-
-        elif nombre.endswith(".docx"):
-            texto = leer_docx(temp.name)
-
-        elif nombre.endswith(".xlsx") or nombre.endswith(".xls"):
-            texto = leer_excel(temp.name)
-
-        elif nombre.endswith((".jpg", ".jpeg", ".png", ".heic", ".webp")):
-            texto = leer_imagen(temp.name)
-
+        # Verificar que se haya enviado un archivo
+        if 'file' not in request.files:
+            return jsonify({
+                "status": "error",
+                "code": 400,
+                "message": "No se envió ningún archivo",
+                "error": "No se envió ningún archivo. Asegúrate de enviar el archivo en el campo 'file'."
+            }), 400
+        
+        file = request.files['file']
+        
+        # Verificar que el archivo tenga nombre
+        if file.filename == '':
+            return jsonify({
+                "status": "error",
+                "code": 400,
+                "message": "Archivo sin nombre",
+                "error": "El archivo enviado no tiene nombre."
+            }), 400
+        
+        # Obtener el nombre del archivo y su extensión
+        filename_original = file.filename
+        filename = secure_filename(file.filename)
+        
+        # Detectar extensión del nombre original primero, luego del nombre seguro
+        if '.' in filename_original:
+            extension = filename_original.rsplit('.', 1)[1].lower()
+        elif '.' in filename:
+            extension = filename.rsplit('.', 1)[1].lower()
         else:
-            return jsonify({"error": f"Formato no soportado: {nombre}"}), 400
-
-        texto = (texto or "").strip()
-
-        if not texto:
-            return jsonify({"error": "No se pudo extraer texto del archivo"}), 422
-
-        return jsonify({"texto": texto})
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
+            extension = ''
+        
+        # Log para diagnóstico
+        logger.info(f"Archivo recibido: {filename_original}")
+        logger.info(f"Nombre seguro: {filename}")
+        logger.info(f"Extensión detectada: {extension}")
+        
+        # Crear archivo temporal
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{extension}' if extension else '') as temp_file:
+            file.save(temp_file.name)
+            temp_path = temp_file.name
+        
         try:
-            os.unlink(temp.name)
-        except Exception:
-            pass
+            # ✅ NUEVA ESTRATEGIA: Procesar TODOS los formatos mediante conversión a PDF
+            logger.info(f"Procesando archivo {extension or 'sin extensión'}: {filename_original}")
+            
+            # Procesar el archivo (el procesador maneja la conversión automáticamente)
+            resultado = processor.procesar_archivo(temp_path, extension)
+            
+            # Verificar que se haya extraído texto
+            texto_extraido = resultado.get("texto", "")
+            
+            # SIEMPRE retornar JSON válido, incluso si el texto está vacío
+            # NUNCA retornar 400 por formato no soportado
+            if texto_extraido and texto_extraido.strip():
+                logger.info(f"Texto extraído exitosamente: {resultado.get('caracteres', 0)} caracteres, {resultado.get('paginas', 0)} páginas")
+                
+                # Retornar JSON completo con toda la información
+                return jsonify({
+                    "texto": texto_extraido,
+                    "caracteres": resultado.get("caracteres", len(texto_extraido)),
+                    "paginas": resultado.get("paginas", 0),
+                    "method": resultado.get("method", "unknown"),
+                    "warnings": resultado.get("warnings", []),
+                    "status": "success"
+                }), 200
+            else:
+                logger.warning(f"No se pudo extraer texto del archivo {extension}")
+                
+                # Intentar como último recurso convertir a PDF y procesar
+                if extension and extension.lower() != 'pdf':
+                    logger.info(f"Intentando conversión de emergencia a PDF para {extension}...")
+                    try:
+                        pdf_path = pdf_converter.convertir_a_pdf(temp_path, extension)
+                        if pdf_path and os.path.exists(pdf_path):
+                            resultado_pdf = processor.procesar_archivo(pdf_path, 'pdf')
+                            texto_pdf = resultado_pdf.get("texto", "")
+                            
+                            if texto_pdf and texto_pdf.strip():
+                                # Limpiar PDF temporal
+                                if pdf_path != temp_path and os.path.exists(pdf_path):
+                                    try:
+                                        os.unlink(pdf_path)
+                                    except:
+                                        pass
+                                
+                                return jsonify({
+                                    "texto": texto_pdf,
+                                    "caracteres": resultado_pdf.get("caracteres", len(texto_pdf)),
+                                    "paginas": resultado_pdf.get("paginas", 0),
+                                    "method": "emergency_pdf_conversion",
+                                    "warnings": resultado_pdf.get("warnings", []) + ["Conversión de emergencia aplicada"],
+                                    "status": "success"
+                                }), 200
+                    except Exception as e:
+                        logger.warning(f"Conversión de emergencia falló: {str(e)}")
+                
+                # Si todo falla, retornar JSON válido con texto vacío (NO 400)
+                # El procesador ya intentó todos los métodos posibles
+                return jsonify({
+                    "texto": texto_extraido or "",
+                    "caracteres": resultado.get("caracteres", 0),
+                    "paginas": resultado.get("paginas", 0),
+                    "method": resultado.get("method", "unknown"),
+                    "warnings": resultado.get("warnings", []) + ["No se pudo extraer texto del documento. Se intentaron múltiples métodos de conversión."],
+                    "status": "success"
+                }), 200
+                
+        except ValueError as e:
+            # Error de formato o procesamiento
+            logger.error(f"Error de procesamiento: {str(e)}")
+            
+            # Intentar conversión de emergencia
+            if extension and extension.lower() != 'pdf':
+                logger.info(f"Intentando conversión de emergencia después de error: {extension}...")
+                try:
+                    pdf_path = pdf_converter.convertir_a_pdf(temp_path, extension)
+                    if pdf_path and os.path.exists(pdf_path):
+                        resultado_pdf = processor.procesar_archivo(pdf_path, 'pdf')
+                        texto_pdf = resultado_pdf.get("texto", "")
+                        
+                        if texto_pdf and texto_pdf.strip():
+                            # Limpiar PDF temporal
+                            if pdf_path != temp_path and os.path.exists(pdf_path):
+                                try:
+                                    os.unlink(pdf_path)
+                                except:
+                                    pass
+                            
+                            return jsonify({
+                                "texto": texto_pdf,
+                                "caracteres": resultado_pdf.get("caracteres", len(texto_pdf)),
+                                "paginas": resultado_pdf.get("paginas", 0),
+                                "method": "emergency_pdf_conversion",
+                                "warnings": resultado_pdf.get("warnings", []) + [f"Recuperado después de error: {str(e)}"],
+                                "status": "success"
+                            }), 200
+                except Exception as e2:
+                    logger.warning(f"Conversión de emergencia falló: {str(e2)}")
+            
+            # NO retornar 400, siempre retornar JSON válido
+            return jsonify({
+                "texto": "",
+                "caracteres": 0,
+                "paginas": 0,
+                "method": "failed",
+                "warnings": [f"Error de procesamiento: {str(e)}"],
+                "status": "success"
+            }), 200
+        except Exception as e:
+            # Otros errores
+            logger.error(f"Error procesando archivo: {str(e)}", exc_info=True)
+            
+            # Último intento: procesar como PDF
+            try:
+                logger.info("Último intento: procesando como PDF genérico...")
+                resultado_pdf = processor.procesar_archivo(temp_path, 'pdf')
+                texto_pdf = resultado_pdf.get("texto", "")
+                
+                if texto_pdf and texto_pdf.strip():
+                    return jsonify({
+                        "texto": texto_pdf,
+                        "caracteres": resultado_pdf.get("caracteres", len(texto_pdf)),
+                        "paginas": resultado_pdf.get("paginas", 0),
+                        "method": "fallback_pdf",
+                        "warnings": resultado_pdf.get("warnings", []) + [f"Procesado como PDF después de error: {str(e)}"],
+                        "status": "success"
+                    }), 200
+            except Exception as e2:
+                logger.error(f"Fallback a PDF también falló: {str(e2)}")
+            
+            return jsonify({
+                "status": "error",
+                "code": 500,
+                "message": "Error al procesar el documento",
+                "error": f"Error interno: {str(e)}"
+            }), 500
+        finally:
+            # Limpiar archivos temporales
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception as e:
+                    logger.warning(f"No se pudo eliminar archivo temporal {temp_path}: {str(e)}")
+    
+    except Exception as e:
+        logger.error(f"Error general: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "code": 500,
+            "message": "Error interno del servidor",
+            "error": str(e)
+        }), 500
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint de salud para verificar que el servidor está funcionando"""
+    # Verificar disponibilidad de herramientas
+    libreoffice_ok = pdf_converter.libreoffice_path is not None
+    unoconv_ok = pdf_converter.unoconv_path is not None
+    
+    return jsonify({
+        "status": "ok",
+        "message": "Servidor funcionando correctamente",
+        "libreoffice_available": libreoffice_ok,
+        "unoconv_available": unoconv_ok,
+        "conversion_available": libreoffice_ok or unoconv_ok
+    }), 200
 
-def leer_pdf(ruta):
-    texto = ""
-    with pdfplumber.open(ruta) as pdf:
-        for pagina in pdf.pages:
-            contenido = pagina.extract_text() or ""
-            texto += contenido + "\n"
-    return texto
-
-
-def leer_docx(ruta):
-    doc = docx.Document(ruta)
-    return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-
-
-def leer_excel(ruta):
-    # Lee todas las hojas y concatena
-    texto = ""
-    xls = pd.read_excel(ruta, sheet_name=None, header=None)
-    for nombre_hoja, df in xls.items():
-        texto += f"\n--- Hoja: {nombre_hoja} ---\n"
-        for fila in df.values:
-            celdas = [str(c) for c in fila if str(c) != 'nan']
-            if celdas:
-                texto += " ".join(celdas) + "\n"
-    return texto
-
-
-def leer_imagen(ruta):
-    img = Image.open(ruta)
-    # Podrías ajustar idioma aquí si usas textos en español: lang="spa"
-    return pytesseract.image_to_string(img)
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Backend Examen Naval funcionando ✔️"
-
-
-if __name__ == "__main__":
-    # Para uso local, en Railway se usará gunicorn
-    app.run(host="0.0.0.0", port=10000)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

@@ -1,45 +1,54 @@
 """
 Backend para procesamiento inteligente de documentos
-Orden de lectura:
-1. Google (Drive / Docs / Vision OCR)
-2. Conversión a PDF (PDFConverter)
-3. Lectura local simple (docx/xlsx/xls/pdf)
+------------------------------------------
+ORDEN PRINCIPAL ONLINE:
+1. Google Docs + Drive API
+2. Simple Reader (docx, xlsx, pdf modernos)
+3. Legacy Reader (ppt, doc, xls antiguos)
+4. OCR Fallback universal
+------------------------------------------
+Compatible con Railway (sin LibreOffice)
 """
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 import os
 import tempfile
-import logging
 import json
+import logging
 
+# Processor principal
 from document_processor import DocumentProcessor
-from pdf_converter import PDFConverter
+from legacy_reader import (
+    leer_ppt_antiguo,
+    leer_doc_antiguo,
+    leer_xls_antiguo,
+    ocr_fallback
+)
 
-# Librerías Google
+# Google APIs
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# -----------------------------------------
-# CONFIGURACIÓN GENERAL
-# -----------------------------------------
+# ------------------------------------------
+# CONFIG GLOBAL
+# ------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
+app.config['MAX_CONTENT_LENGTH'] = 80 * 1024 * 1024  # 80MB
 
 processor = DocumentProcessor()
-pdf_converter = PDFConverter()
 
-# -----------------------------------------
-# CARGAR CREDENCIALES GOOGLE
-# -----------------------------------------
+# ------------------------------------------
+# LOAD GOOGLE CREDENTIALS
+# ------------------------------------------
+
 google_credentials = None
 GOOGLE_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
@@ -53,163 +62,155 @@ if GOOGLE_JSON:
                 "https://www.googleapis.com/auth/cloud-platform"
             ]
         )
-        logger.info("Credenciales de Google cargadas correctamente.")
+        logger.info("Credenciales Google cargadas OK")
     except Exception as e:
         logger.error(f"Error cargando credenciales Google: {e}")
 else:
-    logger.warning("No se encontraron credenciales Google.")
+    logger.warning("No se encontraron credenciales Google")
 
 
-# -----------------------------------------
-# FUNCIÓN: PROCESAR CON GOOGLE
-# -----------------------------------------
+# ------------------------------------------
+# MÉTODO GOOGLE
+# ------------------------------------------
 
-def procesar_con_google(file_path, extension):
-    """
-    Lee documentos usando Google Docs/Drive.
-    Retorna dict con texto o None si falla.
-    """
+def procesar_con_google(path, extension):
+    if not google_credentials:
+        return None
+
     try:
-        if google_credentials is None:
-            return None
-
         drive = build("drive", "v3", credentials=google_credentials)
         docs = build("docs", "v1", credentials=google_credentials)
 
-        # Subir archivo temporal a Google
-        file_metadata = {"name": f"temp.{extension}"}
-        media = MediaFileUpload(file_path, resumable=False)
+        metadata = {"name": f"upload.{extension}"}
+        media = MediaFileUpload(path, resumable=False)
 
-        uploaded = drive.files().create(
-            body=file_metadata,
+        file_uploaded = drive.files().create(
+            body=metadata,
             media_body=media,
             fields="id"
         ).execute()
 
-        file_id = uploaded["id"]
+        file_id = file_uploaded["id"]
 
-        # Convertir usando Google Docs
-        doc = docs.documents().get(documentId=file_id).execute()
+        # Intentar convertir/documento
+        document = docs.documents().get(documentId=file_id).execute()
 
-        texto_google = ""
-
-        for element in doc.get("body").get("content", []):
+        texto = ""
+        for element in document.get("body", {}).get("content", []):
             if "paragraph" in element:
                 for p in element["paragraph"].get("elements", []):
-                    texto_google += p.get("textRun", {}).get("content", "")
+                    texto += p.get("textRun", {}).get("content", "")
 
-        # Borrar archivo de Google
+        # Borrar archivo temporal de Google
         drive.files().delete(fileId=file_id).execute()
 
-        if texto_google.strip():
+        if texto.strip():
             return {
-                "texto": texto_google,
+                "texto": texto,
                 "method": "google",
                 "warnings": []
             }
-
         return None
 
     except Exception as e:
-        logger.error(f"[GOOGLE FALLÓ] {str(e)}")
+        logger.error(f"[GOOGLE ERROR] {e}")
         return None
 
 
-# -----------------------------------------
+# ------------------------------------------
 # ENDPOINT PRINCIPAL
-# -----------------------------------------
+# ------------------------------------------
 
-@app.route('/procesar', methods=['POST'])
+@app.route("/procesar", methods=["POST"])
 def procesar_documento():
-
     try:
-        # 1. Validar archivo
         if "file" not in request.files:
-            return jsonify({"status": "error", "message": "No se envió archivo"}), 400
+            return jsonify({"status": "error", "msg": "No file sent"}), 400
 
         file = request.files["file"]
         filename = secure_filename(file.filename)
 
         if filename == "":
-            return jsonify({"status": "error", "message": "Archivo sin nombre"}), 400
+            return jsonify({"status": "error", "msg": "Empty filename"}), 400
 
-        extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        extension = filename.rsplit(".", 1)[-1].lower()
 
         # Guardar archivo temporal
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as tmp:
             file.save(tmp.name)
-            temp_path = tmp.name
+            path = tmp.name
 
         logger.info(f"Archivo recibido: {filename} ({extension})")
 
-        # -----------------------------------------
-        # 1️⃣ PRIMER MÉTODO: GOOGLE
-        # -----------------------------------------
-        google_result = procesar_con_google(temp_path, extension)
-
+        # 1. GOOGLE
+        google_result = procesar_con_google(path, extension)
         if google_result:
-            logger.info("Google procesó el documento correctamente.")
             return jsonify({
                 "status": "success",
                 **google_result
             }), 200
 
-        # -----------------------------------------
-        # 2️⃣ SEGUNDO MÉTODO: PDFConverter
-        # -----------------------------------------
-        logger.info("Google falló → usando PDFConverter...")
-
-        pdf_result = processor.procesar_archivo(temp_path, extension)
-
-        if pdf_result.get("texto") and pdf_result["texto"].strip():
+        # 2. SIMPLE Modern Reader (docx, xlsx, pdf)
+        simple_result = processor.leer_simple(path, extension)
+        if simple_result:
             return jsonify({
                 "status": "success",
-                "method": "pdf_converter",
-                **pdf_result
+                "method": "simple_reader",
+                "texto": simple_result,
+                "caracteres": len(simple_result),
+                "paginas": simple_result.count("\n") // 20 + 1,
+                "warnings": []
             }), 200
 
-        # -----------------------------------------
-        # 3️⃣ TERCER MÉTODO: LECTOR LOCAL SIMPLE
-        # -----------------------------------------
-        logger.info("PDFConverter falló → intentando lector local simple...")
+        # 3. LEGACY READER
+        legacy_text = ""
+        if extension == "ppt":
+            legacy_text = leer_ppt_antiguo(path)
+        elif extension == "doc":
+            legacy_text = leer_doc_antiguo(path)
+        elif extension == "xls":
+            legacy_text = leer_xls_antiguo(path)
 
-        simple_result = processor.procesar_archivo(temp_path, "simple")
-
-        if simple_result.get("texto") and simple_result["texto"].strip():
+        if legacy_text.strip():
             return jsonify({
                 "status": "success",
-                "method": "simple_local",
-                **simple_result
+                "method": "legacy_reader",
+                "texto": legacy_text,
+                "caracteres": len(legacy_text),
+                "paginas": legacy_text.count("\n") // 20 + 1,
+                "warnings": []
             }), 200
 
-        # -----------------------------------------
-        # 4️⃣ TODO FALLÓ → RESPUESTA VACÍA
-        # -----------------------------------------
+        # 4. OCR fallback
+        fallback_text = ocr_fallback(path)
         return jsonify({
             "status": "success",
-            "method": "none",
-            "texto": "",
-            "caracteres": 0,
-            "paginas": 0,
-            "warnings": ["Ningún método pudo extraer texto"]
+            "method": "ocr_fallback",
+            "texto": fallback_text,
+            "caracteres": len(fallback_text),
+            "paginas": fallback_text.count("\n") // 20 + 1,
+            "warnings": ["OCR fallback used"]
         }), 200
 
     except Exception as e:
-        logger.error(f"Error general: {str(e)}")
-        return jsonify({"status": "error", "message": "Error interno", "error": str(e)}), 500
+        logger.error(f"ERROR GENERAL: {e}")
+        return jsonify({"status": "error", "msg": str(e)}), 500
+    finally:
+        if "path" in locals() and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except:
+                pass
 
 
-# -----------------------------------------
-# ENDPOINT DE SALUD
-# -----------------------------------------
-@app.route('/health', methods=['GET'])
+# ------------------------------------------
+# HEALTH CHECK
+# ------------------------------------------
+
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
 
 
-# -----------------------------------------
-# EJECUCIÓN EN PRODUCCIÓN
-# -----------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)

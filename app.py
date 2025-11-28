@@ -1,208 +1,215 @@
 """
-Backend para procesamiento de documentos
-Soporta TODOS los formatos mediante conversión a PDF: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX, ODT, RTF, CSV, TXT, imágenes, etc.
+Backend para procesamiento inteligente de documentos
+Orden de lectura:
+1. Google (Drive / Docs / Vision OCR)
+2. Conversión a PDF (PDFConverter)
+3. Lectura local simple (docx/xlsx/xls/pdf)
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+
 import os
 import tempfile
 import logging
+import json
 
 from document_processor import DocumentProcessor
 from pdf_converter import PDFConverter
 
-# ----------------------------------------------------------
-# CONFIGURACIÓN GENERAL DEL SERVIDOR
-# ----------------------------------------------------------
+# Librerías Google
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+# -----------------------------------------
+# CONFIGURACIÓN GENERAL
+# -----------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB máximo
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
 
 processor = DocumentProcessor()
 pdf_converter = PDFConverter()
 
+# -----------------------------------------
+# CARGAR CREDENCIALES GOOGLE
+# -----------------------------------------
+google_credentials = None
+GOOGLE_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
-# ----------------------------------------------------------
-# ENDPOINT PRINCIPAL /procesar (tu endpoint original)
-# ----------------------------------------------------------
+if GOOGLE_JSON:
+    try:
+        google_credentials = service_account.Credentials.from_service_account_info(
+            json.loads(GOOGLE_JSON),
+            scopes=[
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/documents",
+                "https://www.googleapis.com/auth/cloud-platform"
+            ]
+        )
+        logger.info("Credenciales de Google cargadas correctamente.")
+    except Exception as e:
+        logger.error(f"Error cargando credenciales Google: {e}")
+else:
+    logger.warning("No se encontraron credenciales Google.")
+
+
+# -----------------------------------------
+# FUNCIÓN: PROCESAR CON GOOGLE
+# -----------------------------------------
+
+def procesar_con_google(file_path, extension):
+    """
+    Lee documentos usando Google Docs/Drive.
+    Retorna dict con texto o None si falla.
+    """
+    try:
+        if google_credentials is None:
+            return None
+
+        drive = build("drive", "v3", credentials=google_credentials)
+        docs = build("docs", "v1", credentials=google_credentials)
+
+        # Subir archivo temporal a Google
+        file_metadata = {"name": f"temp.{extension}"}
+        media = MediaFileUpload(file_path, resumable=False)
+
+        uploaded = drive.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id"
+        ).execute()
+
+        file_id = uploaded["id"]
+
+        # Convertir usando Google Docs
+        doc = docs.documents().get(documentId=file_id).execute()
+
+        texto_google = ""
+
+        for element in doc.get("body").get("content", []):
+            if "paragraph" in element:
+                for p in element["paragraph"].get("elements", []):
+                    texto_google += p.get("textRun", {}).get("content", "")
+
+        # Borrar archivo de Google
+        drive.files().delete(fileId=file_id).execute()
+
+        if texto_google.strip():
+            return {
+                "texto": texto_google,
+                "method": "google",
+                "warnings": []
+            }
+
+        return None
+
+    except Exception as e:
+        logger.error(f"[GOOGLE FALLÓ] {str(e)}")
+        return None
+
+
+# -----------------------------------------
+# ENDPOINT PRINCIPAL
+# -----------------------------------------
 
 @app.route('/procesar', methods=['POST'])
 def procesar_documento():
-    """
-    Endpoint para procesar documentos de forma flexible.
-    Acepta cualquier formato, intenta convertir a PDF, extraer texto y devolverlo.
-    """
+
     try:
-        if 'file' not in request.files:
+        # 1. Validar archivo
+        if "file" not in request.files:
             return jsonify({"status": "error", "message": "No se envió archivo"}), 400
 
-        file = request.files['file']
-        if file.filename == "":
+        file = request.files["file"]
+        filename = secure_filename(file.filename)
+
+        if filename == "":
             return jsonify({"status": "error", "message": "Archivo sin nombre"}), 400
 
-        filename_original = file.filename
-
-        # Extraer extensión
-        extension = filename_original.rsplit('.', 1)[-1].lower() if '.' in filename_original else ''
-
-        logger.info(f"Archivo recibido: {filename_original} | Extensión detectada: {extension}")
+        extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
         # Guardar archivo temporal
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as temp_file:
-            file.save(temp_file.name)
-            temp_path = temp_file.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as tmp:
+            file.save(tmp.name)
+            temp_path = tmp.name
 
-        try:
-            # Procesar usando el procesador general
-            resultado = processor.procesar_archivo(temp_path, extension)
-            texto = resultado.get("texto", "")
+        logger.info(f"Archivo recibido: {filename} ({extension})")
 
-            # Si hay texto → OK
-            if texto.strip():
-                return jsonify({
-                    "status": "success",
-                    "texto": texto,
-                    "caracteres": len(texto),
-                    "paginas": resultado.get("paginas", 0),
-                    "method": resultado.get("method", "main"),
-                    "warnings": resultado.get("warnings", [])
-                }), 200
+        # -----------------------------------------
+        # 1️⃣ PRIMER MÉTODO: GOOGLE
+        # -----------------------------------------
+        google_result = procesar_con_google(temp_path, extension)
 
-            logger.warning("No se pudo extraer texto directamente. Intentando conversión de emergencia...")
-
-            # Intento de conversión a PDF
-            if extension != "pdf":
-                pdf_path = pdf_converter.convertir_a_pdf(temp_path, extension)
-                if pdf_path and os.path.exists(pdf_path):
-                    resultado_pdf = processor.procesar_archivo(pdf_path, "pdf")
-                    texto_pdf = resultado_pdf.get("texto", "")
-
-                    if texto_pdf.strip():
-                        return jsonify({
-                            "status": "success",
-                            "texto": texto_pdf,
-                            "caracteres": len(texto_pdf),
-                            "paginas": resultado_pdf.get("paginas", 0),
-                            "method": "emergency_pdf_conversion",
-                            "warnings": resultado_pdf.get("warnings", [])
-                        }), 200
-
-            # Si todo falla, responder texto vacío
+        if google_result:
+            logger.info("Google procesó el documento correctamente.")
             return jsonify({
                 "status": "success",
-                "texto": "",
-                "caracteres": 0,
-                "paginas": 0,
-                "method": "failed",
-                "warnings": ["No se pudo extraer texto del documento"]
+                **google_result
             }), 200
 
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
+        # -----------------------------------------
+        # 2️⃣ SEGUNDO MÉTODO: PDFConverter
+        # -----------------------------------------
+        logger.info("Google falló → usando PDFConverter...")
 
-    except Exception as e:
-        logger.error(f"Error general en /procesar: {str(e)}", exc_info=True)
-        return jsonify({"status": "error", "message": "Error interno", "error": str(e)}), 500
+        pdf_result = processor.procesar_archivo(temp_path, extension)
 
+        if pdf_result.get("texto") and pdf_result["texto"].strip():
+            return jsonify({
+                "status": "success",
+                "method": "pdf_converter",
+                **pdf_result
+            }), 200
 
-# ----------------------------------------------------------
-# NUEVO ENDPOINT: /procesarDocumentoOnline (ULTRA SIMPLE)
-# PROCESA SIEMPRE TODO → PDF → TEXTO → OCR
-# ----------------------------------------------------------
+        # -----------------------------------------
+        # 3️⃣ TERCER MÉTODO: LECTOR LOCAL SIMPLE
+        # -----------------------------------------
+        logger.info("PDFConverter falló → intentando lector local simple...")
 
-@app.route('/procesarDocumentoOnline', methods=['POST'])
-def procesar_documento_online():
-    """
-    Modo ONLINE simplificado:
-    1. Recibe archivo
-    2. Convierte TODO a PDF
-    3. Extrae texto
-    4. Si no hay texto → OCR
-    5. Devuelve respuesta siempre exitosa
-    """
-    try:
-        if 'file' not in request.files:
-            return jsonify({"status": "error", "message": "No se envió archivo"}), 400
+        simple_result = processor.procesar_archivo(temp_path, "simple")
 
-        file = request.files['file']
-        filename_original = file.filename
+        if simple_result.get("texto") and simple_result["texto"].strip():
+            return jsonify({
+                "status": "success",
+                "method": "simple_local",
+                **simple_result
+            }), 200
 
-        if filename_original == "":
-            return jsonify({"status": "error", "message": "Archivo vacío"}), 400
-
-        extension = filename_original.split(".")[-1].lower()
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as temp_file:
-            file.save(temp_file.name)
-            temp_path = temp_file.name
-
-        # 1. Convertir TODO a PDF
-        if extension != "pdf":
-            pdf_path = pdf_converter.convertir_a_pdf(temp_path, extension)
-        else:
-            pdf_path = temp_path
-
-        # 2. Procesar PDF normal
-        resultado = processor.procesar_archivo(pdf_path, "pdf")
-        texto = resultado.get("texto", "")
-
-        # 3. Si no hay texto → OCR
-        if not texto.strip():
-            logger.info("No hay texto. Intentando OCR...")
-            resultado_ocr = processor.procesar_archivo(pdf_path, "ocr")
-            texto = resultado_ocr.get("texto", "")
-
-            if texto.strip():
-                resultado = resultado_ocr
-
+        # -----------------------------------------
+        # 4️⃣ TODO FALLÓ → RESPUESTA VACÍA
+        # -----------------------------------------
         return jsonify({
             "status": "success",
-            "texto": texto,
-            "caracteres": len(texto),
-            "paginas": resultado.get("paginas", 1),
-            "method": resultado.get("method", "online"),
-            "warnings": resultado.get("warnings", [])
+            "method": "none",
+            "texto": "",
+            "caracteres": 0,
+            "paginas": 0,
+            "warnings": ["Ningún método pudo extraer texto"]
         }), 200
 
     except Exception as e:
-        logger.error(f"Error en /procesarDocumentoOnline: {str(e)}")
-        return jsonify({"status": "error", "message": "Error procesando archivo", "error": str(e)}), 500
-
-    finally:
-        try:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-        except:
-            pass
+        logger.error(f"Error general: {str(e)}")
+        return jsonify({"status": "error", "message": "Error interno", "error": str(e)}), 500
 
 
-# ----------------------------------------------------------
+# -----------------------------------------
 # ENDPOINT DE SALUD
-# ----------------------------------------------------------
-
+# -----------------------------------------
 @app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "ok",
-        "message": "Servidor funcionando correctamente",
-        "conversion_available": True
-    }), 200
+def health():
+    return jsonify({"status": "ok"}), 200
 
 
-# ----------------------------------------------------------
+# -----------------------------------------
 # EJECUCIÓN EN PRODUCCIÓN
-# ----------------------------------------------------------
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+# -----------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)

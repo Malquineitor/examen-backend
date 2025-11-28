@@ -13,3 +13,4 @@ gunicorn==21.2.0
 chardet
 python-pptx==0.6.21
 python-magic==0.4.27
+pytesseract==0.3.10

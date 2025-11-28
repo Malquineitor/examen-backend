@@ -15,7 +15,7 @@ Compatible con Railway.
 
 import PyPDF2
 from openpyxl import load_workbook
-import python_docx
+import docx
 import pandas as pd
 import os
 import re

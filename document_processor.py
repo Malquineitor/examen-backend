@@ -1,128 +1,138 @@
 """
 document_processor.py
---------------------------------------------
+-----------------------------------------------------
 Procesador simple y moderno para:
-- DOCX
-- XLSX
-- PDF
-- TXT
-- CSV
+ - DOCX
+ - XLSX
+ - XLS
+ - PDF
+ - TXT
+ - CSV
 
-NO usa LibreOffice.
-Compatible con Railway.
---------------------------------------------
+Compatible con Railway (sin LibreOffice).
+-----------------------------------------------------
 """
 
-import PyPDF2
+from docx import Document
 from openpyxl import load_workbook
-import docx
-import pandas as pd
+from PyPDF2 import PdfReader
 import os
 import re
+import xlrd   # Para XLS antiguos
 
 
 class DocumentProcessor:
 
-    # ----------------------------------------
+    # ------------------------------------------
     # LECTOR SIMPLE (formatos modernos)
-    # ----------------------------------------
+    # ------------------------------------------
     def leer_simple(self, path, extension):
         try:
+            # ------------------------------
+            # DOCX
+            # ------------------------------
             if extension == "docx":
-                return self._leer_docx(path)
+                doc = Document(path)
+                texto = "\n".join([p.text for p in doc.paragraphs])
+                return {"texto": texto, "method": "docx", "warnings": []}
 
-            if extension == "xlsx":
-                return self._leer_xlsx(path)
+            # ------------------------------
+            # XLSX
+            # ------------------------------
+            elif extension == "xlsx":
+                libro = load_workbook(filename=path, data_only=True)
+                texto = ""
+                for hoja in libro.sheetnames:
+                    ws = libro[hoja]
+                    for row in ws.iter_rows():
+                        texto += " ".join([str(c.value) if c.value is not None else "" for c in row]) + "\n"
+                return {"texto": texto, "method": "xlsx", "warnings": []}
 
-            if extension == "csv":
-                return self._leer_csv(path)
+            # ------------------------------
+            # XLS (antiguo)
+            # ------------------------------
+            elif extension == "xls":
+                texto = ""
+                libro = xlrd.open_workbook(path)
+                for hoja in libro.sheets():
+                    for row_idx in range(hoja.nrows):
+                        fila = hoja.row_values(row_idx)
+                        texto += " ".join([str(v) for v in fila]) + "\n"
 
-            if extension == "txt":
-                return self._leer_txt(path)
+                return {"texto": texto, "method": "xls", "warnings": []}
 
-            if extension == "pdf":
-                return self._leer_pdf(path)
+            # ------------------------------
+            # TXT
+            # ------------------------------
+            elif extension == "txt":
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    return {"texto": f.read(), "method": "txt", "warnings": []}
+
+            # ------------------------------
+            # CSV
+            # ------------------------------
+            elif extension == "csv":
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    return {"texto": f.read(), "method": "csv", "warnings": []}
+
+            return {"texto": "", "method": "simple_unknown", "warnings": ["Formato no compatible en simple"]}
 
         except Exception as e:
-            print(f"[simple_reader] Error: {e}")
+            return {"texto": "", "method": "simple_error", "warnings": [str(e)]}
 
-        return None
-
-    # ----------------------------------------
-    # LECTORES INDIVIDUALES
-    # ----------------------------------------
-
-    def _leer_docx(self, path):
+    # ------------------------------------------
+    # LECTOR PDF (moderno)
+    # ------------------------------------------
+    def leer_pdf(self, path):
         try:
-            doc = python_docx.Document(path)
-            texto = "\n".join([p.text for p in doc.paragraphs])
-            return self._limpiar(texto)
-        except Exception as e:
-            print(f"[DOCX] error: {e}")
-            return None
-
-    def _leer_xlsx(self, path):
-        try:
-            wb = load_workbook(path, read_only=True)
+            reader = PdfReader(path)
             texto = ""
-            for sheet in wb.sheetnames:
-                sh = wb[sheet]
-                for row in sh.iter_rows(values_only=True):
-                    texto += " ".join([str(v) for v in row]) + "\n"
-            return self._limpiar(texto)
+            for page in reader.pages:
+                texto += page.extract_text() or ""
+
+            return {"texto": texto, "method": "pdf", "warnings": []}
         except Exception as e:
-            print(f"[XLSX] error: {e}")
-            return None
+            return {"texto": "", "method": "pdf_error", "warnings": [str(e)]}
 
-    def _leer_csv(self, path):
-        try:
-            df = pd.read_csv(path)
-            texto = df.to_string()
-            return self._limpiar(texto)
-        except Exception as e:
-            print(f"[CSV] error: {e}")
-            return None
+    # ------------------------------------------
+    # FUNCIÓN PRINCIPAL
+    # ------------------------------------------
+    def procesar_archivo(self, path, extension):
+        extension = extension.lower()
 
-    def _leer_txt(self, path):
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                return self._limpiar(f.read())
-        except Exception as e:
-            print(f"[TXT] error: {e}")
-            return None
+        # --------------------------------------
+        # PDF
+        # --------------------------------------
+        if extension == "pdf":
+            return self.leer_pdf(path)
 
-    def _leer_pdf(self, path):
-        try:
-            texto = ""
-            with open(path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
-                for page in reader.pages:
-                    texto += page.extract_text() or ""
-            return self._limpiar(texto)
-        except Exception as e:
-            print(f"[PDF] error: {e}")
-            return None
+        # --------------------------------------
+        # SIMPLE (docx, xlsx, xls, txt, csv)
+        # --------------------------------------
+        simple_res = self.leer_simple(path, extension)
+        if simple_res.get("texto") and simple_res["texto"].strip():
+            return simple_res
 
-    # ----------------------------------------
-    # LIMPIAR TEXTO (quita logs, OCR, errores)
-    # ----------------------------------------
+        # Si simple falló, retorno lo que tenga
+        return simple_res
 
-    def _limpiar(self, texto):
+    # ------------------------------------------
+    # LIMPIAR TEXTO (opcional)
+    # ------------------------------------------
+    def limpiar_texto(self, texto):
         if not texto:
-            return ""
+            return texto
 
-        # Quitar logs de OCR que ensucian el documento
         patrones = [
-            r"ERROR_OCR.*",
-            r"OCR_FAILED.*",
-            r"TESSERACT.*",
-            r"PAGINA_\d+",
-            r"MODO_RECUPERACION.*",
+            r"ERROR_OCR_.*",
+            r"OCR_.*",
+            r"TESSERACT_.*",
+            r"PAGINA_.*",
+            r"MODO_.*",
             r"error.*",
-            r"failed.*"
+            r"fail.*"
         ]
         for p in patrones:
             texto = re.sub(p, "", texto, flags=re.IGNORECASE)
 
-        texto = texto.replace("\x00", "")  # quitar caracteres nulos
         return texto.strip()

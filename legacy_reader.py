@@ -5,7 +5,8 @@ Lector universal para documentos antiguos:
 - PPT (1997-2003)
 - DOC (1997-2003)
 - XLS (1997-2003)
-- OCR fallback universal
+- OCR fallback normal
+- OCR agresivo (último recurso real)
 
 Compatible con Railway (NO usa LibreOffice)
 ---------------------------------------
@@ -18,6 +19,10 @@ import xlrd
 import tempfile
 import os
 
+# Para OCR agresivo
+import cv2
+import numpy as np
+from pdf2image import convert_from_path
 
 # ---------------------------------------
 # 1. LEER PPT ANTIGUOS (.ppt)
@@ -52,9 +57,8 @@ def leer_ppt_antiguo(path):
 
 def render_slide_as_image(slide, index):
     """
-    Crea una imagen blanca para simular render del slide.
-    python-pptx no puede renderizar nativamente,
-    pero generamos una imagen base para aplicar OCR si hay texto incrustado.
+    Genera imagen en blanco del slide.
+    NOTA: python-pptx no renderiza el slide real sin librerías externas.
     """
     try:
         img = Image.new("RGB", (1920, 1080), "white")
@@ -73,20 +77,19 @@ def render_slide_as_image(slide, index):
 def leer_doc_antiguo(path):
     """
     Intenta extraer texto de .doc antiguo.
-    Como Railway no soporta antiword ni LibreOffice,
-    usamos fallbacks y OCR.
+    Como Railway/Render no soportan LibreOffice,
+    usamos:
+    1. Lectura binaria
+    2. OCR fallback
     """
-    # Intento 1: leer como texto binario (algunas versiones permiten esto)
     try:
         with open(path, "rb") as f:
             raw = f.read().decode("latin-1", errors="ignore")
-            # Si detectamos texto legible
             if len(raw.strip()) > 50:
                 return raw
     except:
         pass
 
-    # Intento 2: OCR fallback
     return ocr_fallback(path)
 
 
@@ -109,18 +112,17 @@ def leer_xls_antiguo(path):
     except Exception as e:
         print(f"[legacy_reader] XLS error: {e}")
 
-    # fallback si falla
     return ocr_fallback(path)
 
 
 # ---------------------------------------
-# 4. OCR FALLBACK UNIVERSAL
+# 4. OCR FALLBACK NORMAL
 # ---------------------------------------
 
 def ocr_fallback(path):
     """
-    Último recurso si el archivo no puede parsearse.
-    Crea una imagen blanca y hace OCR (mínimo texto).
+    OCR básico — último recurso simple.
+    CREA UNA HOJA BLANCA, por eso funciona poco.
     """
     try:
         img = Image.new("RGB", (2000, 2000), "white")
@@ -134,4 +136,57 @@ def ocr_fallback(path):
 
     except Exception as e:
         print(f"[legacy_reader] OCR fallback error: {e}")
+        return ""
+
+
+# ======================================================
+# 5. OCR AGRESIVO — SOLO SE USA CUANDO TODO FALLA
+# ======================================================
+
+def ocr_agresivo(pdf_path):
+    """
+    OCR con preprocesamiento fuerte:
+    - convierte PDF → imágenes a 300 DPI
+    - escala 2X
+    - blanco y negro
+    - elimina ruido
+    - threshold adaptativo
+    - funciona incluso con banners y PDFs raros
+    """
+
+    try:
+        pages = convert_from_path(pdf_path, dpi=300)
+        texto_final = ""
+
+        for page in pages:
+            # PIL → OpenCV
+            img = cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR)
+
+            # Escalar 2X para mejorar nitidez
+            img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+            # Blanco y negro
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # Reducir ruido
+            blur = cv2.GaussianBlur(gray, (5,5), 0)
+
+            # Resaltar letras
+            thresh = cv2.adaptiveThreshold(
+                blur,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                11,
+                2
+            )
+
+            # OCR agresivo
+            text = pytesseract.image_to_string(thresh, lang="spa+eng")
+            texto_final += text + "\n"
+
+        return texto_final.strip()
+
+    except Exception as e:
+        print(f"[legacy_reader] OCR Agresivo Error: {e}")
         return ""

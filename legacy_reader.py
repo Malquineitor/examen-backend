@@ -6,7 +6,7 @@ Lector universal para documentos antiguos:
 - DOC (1997-2003)
 - XLS (1997-2003)
 - OCR fallback normal
-- OCR agresivo (sin cv2) compatible con Railway/Render
+- OCR agresivo (compatible con Railway/Render)
 
 ---------------------------------------
 """
@@ -17,7 +17,6 @@ import pytesseract
 import xlrd
 import tempfile
 import os
-import numpy as np
 from pdf2image import convert_from_path
 
 # ---------------------------------------
@@ -98,6 +97,9 @@ def leer_xls_antiguo(path):
 # ---------------------------------------
 
 def ocr_fallback(path):
+    """
+    OCR básico — último recurso simple.
+    """
     try:
         img = Image.new("RGB", (2000, 2000), "white")
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
@@ -113,17 +115,17 @@ def ocr_fallback(path):
         return ""
 
 # ---------------------------------------
-# 5. OCR AGRESIVO (SIN CV2)
+# 5. OCR AGRESIVO (COMPATIBLE)
 # ---------------------------------------
 
 def ocr_agresivo(pdf_path):
     """
-    OCR agresivo compatible con Railway/Render.
+    OCR agresivo sin OpenCV ni NumPy:
     - Convierte PDF → imágenes
-    - Aumenta tamaño 2X
-    - Convierte a blanco y negro
+    - Escala 2X
+    - Blanco y negro
     - Aumenta contraste
-    - Reduce ruido
+    - Filtros de nitidez y reducción de ruido
     """
     try:
         pages = convert_from_path(pdf_path, dpi=300)
@@ -132,25 +134,18 @@ def ocr_agresivo(pdf_path):
         for page in pages:
             img = page
 
-            # Escalar 2X
             w, h = img.size
-            img = img.resize((w * 2, h * 2), Image.LANCZOS)
+            img = img.resize((w*2, h*2), Image.LANCZOS)
 
-            # Convertir a blanco y negro
             img = ImageOps.grayscale(img)
 
-            # Filtro de nitidez
             img = img.filter(ImageFilter.SHARPEN)
 
-            # Aumentar contraste
             img = ImageOps.autocontrast(img)
 
-            # Reducir ruido
             img = img.filter(ImageFilter.MedianFilter(size=3))
 
-            # OCR agresivo
             text = pytesseract.image_to_string(img, lang="spa+eng")
-
             texto_final += text + "\n"
 
         return texto_final.strip()

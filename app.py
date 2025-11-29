@@ -4,7 +4,8 @@ Backend híbrido para lectura de documentos:
 2. PDFConverter (si existiera)
 3. Lector simple (docx, xlsx, pdf, txt)
 4. Legacy Reader (ppt/doc/xls antiguos)
-5. OCR universal (último recurso)
+5. OCR universal
+6. OCR agresivo (último recurso REAL)
 
 Compatible con Railway sin LibreOffice
 Compatible con Google Workspace Shared Drive
@@ -52,12 +53,12 @@ SHARED_DRIVE_ID = "0APWpYgysES7jUk9PVA"
 from PyPDF2 import PdfReader
 
 def pdf_tiene_texto(file_path):
-    """Devuelve True si el PDF contiene texto interno (no solo imágenes)."""
+    """Devuelve True si el PDF contiene texto interno."""
     try:
         reader = PdfReader(file_path)
         for page in reader.pages:
-            text = page.extract_text()
-            if text and text.strip():
+            t = page.extract_text()
+            if t and t.strip():
                 return True
         return False
     except:
@@ -86,7 +87,7 @@ else:
     logger.warning("No se encontraron credenciales Google.")
 
 # ----------------------------------------------------
-# MÉTODO 1: PROCESAR CON GOOGLE DOCS
+# PROCESAR CON GOOGLE DOCS
 # ----------------------------------------------------
 def procesar_con_google(file_path, extension):
     if google_credentials is None:
@@ -123,6 +124,8 @@ def procesar_con_google(file_path, extension):
             return None
 
         texto_google = ""
+
+        # Extraer texto
         for element in doc.get("body", {}).get("content", []):
             if "paragraph" in element:
                 for e in element["paragraph"]["elements"]:
@@ -170,7 +173,7 @@ def procesar_documento():
         logger.info(f"Archivo recibido: {filename} ({extension})")
 
         # ------------------------------------------------
-        # 1️⃣ MÉTODO GOOGLE (solo si PDF tiene texto)
+        # 1️⃣ GOOGLE DOCS (solo si el PDF tiene texto)
         # ------------------------------------------------
         usar_google = True
 
@@ -211,9 +214,10 @@ def procesar_documento():
             return jsonify({"status": "success", **legacy_res}), 200
 
         # ------------------------------------------------
-        # 5️⃣ OCR UNIVERSAL
+        # 5️⃣ OCR NORMAL
         # ------------------------------------------------
         ocr_text = legacy_reader.ocr_fallback(temp_path)
+
         if ocr_text.strip():
             return jsonify({
                 "status": "success",
@@ -222,8 +226,23 @@ def procesar_documento():
                 "warnings": []
             }), 200
 
+        logger.info("OCR normal no extrajo texto → activando OCR agresivo...")
+
         # ------------------------------------------------
-        # 6️⃣ TODO FALLÓ
+        # 6️⃣ OCR AGRESIVO
+        # ------------------------------------------------
+        ocr_text_agresivo = legacy_reader.ocr_agresivo(temp_path)
+
+        if ocr_text_agresivo.strip():
+            return jsonify({
+                "status": "success",
+                "texto": ocr_text_agresivo,
+                "method": "ocr_aggressive",
+                "warnings": ["Se usó OCR agresivo por baja calidad del documento"]
+            }), 200
+
+        # ------------------------------------------------
+        # 7️⃣ NADA FUNCIONÓ
         # ------------------------------------------------
         return jsonify({
             "status": "success",
@@ -236,14 +255,12 @@ def procesar_documento():
         logger.error(f"ERROR GENERAL: {e}")
         return jsonify({"status": "error", "message": "Error interno", "error": str(e)}), 500
 
-
 # ----------------------------------------------------
 # HEALTH CHECK
 # ----------------------------------------------------
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"}), 200
-
 
 # ----------------------------------------------------
 # EJECUCIÓN

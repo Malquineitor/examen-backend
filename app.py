@@ -1,6 +1,4 @@
 """
-app.py FINAL
-----------------------------------------------------
 Backend híbrido para lectura de documentos:
 1. Google Docs (Shared Drive)
 2. PDFConverter (si existiera)
@@ -32,7 +30,6 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-
 # ----------------------------------------------------
 # CONFIGURACIÓN
 # ----------------------------------------------------
@@ -49,6 +46,22 @@ pdf_converter = PDFConverter()
 
 SHARED_DRIVE_ID = "0APWpYgysES7jUk9PVA"
 
+# ----------------------------------------------------
+# DETECTAR SI EL PDF TIENE TEXTO REAL
+# ----------------------------------------------------
+from PyPDF2 import PdfReader
+
+def pdf_tiene_texto(file_path):
+    """Devuelve True si el PDF contiene texto interno (no solo imágenes)."""
+    try:
+        reader = PdfReader(file_path)
+        for page in reader.pages:
+            text = page.extract_text()
+            if text and text.strip():
+                return True
+        return False
+    except:
+        return False
 
 # ----------------------------------------------------
 # CARGAR CREDENCIALES GOOGLE
@@ -72,9 +85,8 @@ if GOOGLE_JSON:
 else:
     logger.warning("No se encontraron credenciales Google.")
 
-
 # ----------------------------------------------------
-# MÉTODO 1: PROCESAR CON GOOGLE
+# MÉTODO 1: PROCESAR CON GOOGLE DOCS
 # ----------------------------------------------------
 def procesar_con_google(file_path, extension):
     if google_credentials is None:
@@ -84,7 +96,6 @@ def procesar_con_google(file_path, extension):
         drive = build("drive", "v3", credentials=google_credentials)
         docs = build("docs", "v1", credentials=google_credentials)
 
-        # Subir archivo a unidad compartida
         file_metadata = {
             "name": f"temp.{extension}",
             "parents": [SHARED_DRIVE_ID]
@@ -101,29 +112,22 @@ def procesar_con_google(file_path, extension):
         file_id = subida["id"]
         logger.info(f"Archivo subido a unidad compartida: {file_id}")
 
-        # Intentar convertir con Google Docs
         try:
             doc = docs.documents().get(documentId=file_id).execute()
         except Exception as e:
             logger.error(f"Google Docs no pudo abrir el archivo: {e}")
-
-            # Borrar archivo
             try:
                 drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
             except:
                 pass
-
             return None
 
         texto_google = ""
-
-        # Extraer texto
         for element in doc.get("body", {}).get("content", []):
             if "paragraph" in element:
                 for e in element["paragraph"]["elements"]:
                     texto_google += e.get("textRun", {}).get("content", "")
 
-        # Borrar archivo
         try:
             drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
         except:
@@ -141,7 +145,6 @@ def procesar_con_google(file_path, extension):
 
     return None
 
-
 # ----------------------------------------------------
 # ENDPOINT PRINCIPAL
 # ----------------------------------------------------
@@ -149,9 +152,6 @@ def procesar_con_google(file_path, extension):
 def procesar_documento():
 
     try:
-        # ---------------------------
-        # Validar archivo
-        # ---------------------------
         if "file" not in request.files:
             return jsonify({"status": "error", "message": "No se envió archivo"}), 400
 
@@ -163,7 +163,6 @@ def procesar_documento():
 
         extension = filename.rsplit(".", 1)[-1].lower()
 
-        # Guardar temporal
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as tmp:
             file.save(tmp.name)
             temp_path = tmp.name
@@ -171,14 +170,22 @@ def procesar_documento():
         logger.info(f"Archivo recibido: {filename} ({extension})")
 
         # ------------------------------------------------
-        # 1️⃣ MÉTODO GOOGLE
+        # 1️⃣ MÉTODO GOOGLE (solo si PDF tiene texto)
         # ------------------------------------------------
-        google_result = procesar_con_google(temp_path, extension)
-        if google_result and google_result["texto"].strip():
-            return jsonify({"status": "success", **google_result}), 200
+        usar_google = True
+
+        if extension == "pdf":
+            if not pdf_tiene_texto(temp_path):
+                logger.info("PDF sin texto interno → saltando Google Docs.")
+                usar_google = False
+
+        if usar_google:
+            google_result = procesar_con_google(temp_path, extension)
+            if google_result and google_result["texto"].strip():
+                return jsonify({"status": "success", **google_result}), 200
 
         # ------------------------------------------------
-        # 2️⃣ PDF CONVERTER (si Railway algún día lo soportara)
+        # 2️⃣ PDF Converter
         # ------------------------------------------------
         try:
             pdf_res = pdf_converter.convertir_a_pdf(temp_path, extension)
@@ -190,14 +197,14 @@ def procesar_documento():
             pass
 
         # ------------------------------------------------
-        # 3️⃣ SIMPLE (docx, xlsx, xls, pdf, txt, csv)
+        # 3️⃣ SIMPLE
         # ------------------------------------------------
         simple_res = processor.leer_simple(temp_path, extension)
         if simple_res["texto"].strip():
             return jsonify({"status": "success", **simple_res}), 200
 
         # ------------------------------------------------
-        # 4️⃣ LEGACY (ppt/doc/xls antiguos)
+        # 4️⃣ LEGACY
         # ------------------------------------------------
         legacy_res = processor.leer_legacy(temp_path, extension)
         if legacy_res["texto"].strip():

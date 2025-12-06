@@ -1,11 +1,17 @@
 """
-document_processor.py FINAL
+document_processor.py FINAL (2025)
 -----------------------------------------------------
 Orden de lectura:
  1. Simple moderno (docx, xlsx, xls, pdf, txt, csv)
  2. Legacy Reader (ppt antiguos, doc antiguos, xls antiguos)
  3. OCR fallback
 -----------------------------------------------------
+
+Incluye mejoras del modo IA de la app Android:
+ - Limpieza profunda de texto
+ - División en bloques igual que la app
+ - Cálculo dinámico de preguntas
+ - Recorte por tipo (BASICO, MODERADO, COMPLETO)
 """
 
 from docx import Document
@@ -15,15 +21,15 @@ import os
 import re
 import xlrd
 
-# IMPORTAR LEGACY
+# Legacy readers
 import legacy_reader
 
 
 class DocumentProcessor:
 
-    # ------------------------------------------
-    # 1. LECTOR SIMPLE (modernos)
-    # ------------------------------------------
+    # ======================================================
+    # 🔹 1. LECTOR SIMPLE (modernos)
+    # ======================================================
     def leer_simple(self, path, extension):
         try:
             # DOCX
@@ -42,7 +48,7 @@ class DocumentProcessor:
                         texto += " ".join([str(c.value) if c.value else "" for c in row]) + "\n"
                 return {"texto": texto, "method": "xlsx", "warnings": []}
 
-            # XLS (moderno)
+            # XLS moderno
             elif extension == "xls":
                 texto = ""
                 libro = xlrd.open_workbook(path)
@@ -67,9 +73,9 @@ class DocumentProcessor:
         except Exception as e:
             return {"texto": "", "method": "simple_error", "warnings": [str(e)]}
 
-    # ------------------------------------------
-    # 2. LECTOR PDF
-    # ------------------------------------------
+    # ======================================================
+    # 🔹 2. LECTOR PDF
+    # ======================================================
     def leer_pdf(self, path):
         try:
             reader = PdfReader(path)
@@ -81,9 +87,9 @@ class DocumentProcessor:
         except Exception as e:
             return {"texto": "", "method": "pdf_error", "warnings": [str(e)]}
 
-    # ------------------------------------------
-    # 3. LECTOR LEGACY
-    # ------------------------------------------
+    # ======================================================
+    # 🔹 3. LECTOR LEGACY
+    # ======================================================
     def leer_legacy(self, path, extension):
         try:
             if extension == "ppt":
@@ -103,9 +109,9 @@ class DocumentProcessor:
 
         return {"texto": "", "method": "legacy_none", "warnings": []}
 
-    # ------------------------------------------
-    # 4. OCR UNIVERSAL
-    # ------------------------------------------
+    # ======================================================
+    # 🔹 4. OCR UNIVERSAL
+    # ======================================================
     def ocr(self, path):
         try:
             texto = legacy_reader.ocr_fallback(path)
@@ -113,32 +119,98 @@ class DocumentProcessor:
         except Exception as e:
             return {"texto": "", "method": "ocr_error", "warnings": [str(e)]}
 
-    # ------------------------------------------
-    # ORDEN PRINCIPAL
-    # ------------------------------------------
+    # ======================================================
+    # 🔹 5. LIMPIEZA DE TEXTO (nuevo, igual a la app)
+    # ======================================================
+    def limpiar_texto(self, texto: str):
+        texto = texto.replace("\u200b", "").replace("\ufeff", "")
+        texto = re.sub(r"(OCR|PAGINA_\d+|ERROR|FAILED|SCAN)", "", texto, flags=re.I)
+        texto = re.sub(r"\s+", " ", texto)
+        return texto.strip()
+
+    # ======================================================
+    # 🔹 6. DIVISIÓN EN BLOQUES (igual a la app Android)
+    # ======================================================
+    def dividir_en_bloques(self, texto, min_size=1200, max_size=2000):
+
+        lineas = texto.split("\n")
+        bloques = []
+        actual = ""
+
+        for linea in lineas:
+            if len(actual) + len(linea) > max_size:
+                bloques.append(actual.strip())
+                actual = linea
+            else:
+                actual += " " + linea
+
+        if actual.strip():
+            bloques.append(actual.strip())
+
+        # Unir bloque final pequeño (<300 chars)
+        if len(bloques) >= 2 and len(bloques[-1]) < 300:
+            bloques[-2] += " " + bloques[-1]
+            bloques.pop()
+
+        return bloques
+
+    # ======================================================
+    # 🔹 7. CÁLCULO DE PREGUNTAS POR BLOQUE
+    # ======================================================
+    def calcular_preguntas_por_bloque(self, total_bloques):
+        try:
+            base = int(200 / max(1, total_bloques))
+            return max(8, min(25, base))
+        except:
+            return 8
+
+    # ======================================================
+    # 🔹 8. RECORTE POR TIPO DE TEST (opcional)
+    # ======================================================
+    def recortar_por_tipo(self, texto, tipo):
+        """
+        Tipos:
+        - basico → 1500 caracteres
+        - moderado → 4000 caracteres
+        - completo → 10000 caracteres
+        """
+
+        limites = {
+            "basico": 1500,
+            "moderado": 4000,
+            "completo": 10000
+        }
+
+        limite = limites.get(tipo.lower(), 10000)
+        return texto[:limite]
+
+    # ======================================================
+    # 🔹 9. ORDEN PRINCIPAL
+    # ======================================================
     def procesar_archivo(self, path, extension):
         extension = extension.lower()
 
-        # PDF → lectura directa
+        # 1️⃣ PDF directo
         if extension == "pdf":
             r_pdf = self.leer_pdf(path)
             if r_pdf["texto"].strip():
                 return r_pdf
 
-        # SIMPLE
+        # 2️⃣ Simple reader
         r_simple = self.leer_simple(path, extension)
         if r_simple["texto"].strip():
             return r_simple
 
-        # LEGACY
+        # 3️⃣ Legacy reader
         r_legacy = self.leer_legacy(path, extension)
         if r_legacy["texto"].strip():
             return r_legacy
 
-        # OCR (último recurso)
+        # 4️⃣ OCR fallback
         r_ocr = self.ocr(path)
         if r_ocr["texto"].strip():
             return r_ocr
 
         # Nada funcionó
         return {"texto": "", "method": "none", "warnings": ["No se pudo leer el documento"]}
+

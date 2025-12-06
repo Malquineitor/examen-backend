@@ -10,6 +10,8 @@ Backend híbrido para lectura de documentos:
 Compatible con Railway sin LibreOffice
 Compatible con Google Workspace Shared Drive
 ----------------------------------------------------
+INTEGRACIÓN COMPLETA CON GEMINI DESDE BACKEND
+----------------------------------------------------
 """
 
 from flask import Flask, request, jsonify
@@ -20,6 +22,7 @@ import os
 import tempfile
 import json
 import logging
+import requests   # <--- NECESARIO PARA LLAMAR A GEMINI
 
 # Procesadores
 from document_processor import DocumentProcessor
@@ -148,8 +151,92 @@ def procesar_con_google(file_path, extension):
 
     return None
 
+
 # ----------------------------------------------------
-# ENDPOINT PRINCIPAL
+# 🔥🔥🔥 GEMINI DESDE BACKEND – NUEVA FUNCIÓN
+# ----------------------------------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+MODEL = "gemini-1.5-flash-latest"
+ENDPOINT = f"https://generativelanguage.googleapis.com/v1/models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+def generar_test_con_gemini(texto, num_preguntas):
+
+    if not GEMINI_API_KEY:
+        return {"error": "GEMINI_API_KEY no configurada en Render"}
+
+    prompt = f"""
+Genera un examen de {num_preguntas} preguntas basado en este documento:
+
+{texto}
+
+Formato JSON:
+{{
+  "title": "",
+  "questions": [
+    {{
+      "question": "",
+      "options": ["", "", "", ""],
+      "answer": ""
+    }}
+  ]
+}}
+"""
+
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
+
+    try:
+        response = requests.post(ENDPOINT, json=body)
+        data = response.json()
+    except Exception as e:
+        return {"error": f"Error comunicando con Gemini: {e}"}
+
+    if response.status_code != 200:
+        return {
+            "error": "Gemini API error",
+            "status": response.status_code,
+            "details": data
+        }
+
+    try:
+        texto_generado = data["candidates"][0]["content"]["parts"][0]["text"]
+    except:
+        texto_generado = ""
+
+    return {
+        "success": True,
+        "raw": data,
+        "text": texto_generado
+    }
+
+
+# ----------------------------------------------------
+# 📌 NUEVO ENDPOINT PARA LA APP: /ai/generate
+# ----------------------------------------------------
+@app.route('/ai/generate', methods=['POST'])
+def generar_examen_ai():
+    data = request.json
+
+    texto = data.get("texto", "")
+    num_preguntas = data.get("num_preguntas", 20)
+
+    if not texto.strip():
+        return jsonify({"error": "El campo 'texto' está vacío"}), 400
+
+    resultado = generar_test_con_gemini(texto, num_preguntas)
+    return jsonify(resultado)
+
+
+# ----------------------------------------------------
+# ENDPOINT PRINCIPAL EXISTENTE (procesar documento)
 # ----------------------------------------------------
 @app.route('/procesar', methods=['POST'])
 def procesar_documento():
@@ -172,14 +259,10 @@ def procesar_documento():
 
         logger.info(f"Archivo recibido: {filename} ({extension})")
 
-        # ------------------------------------------------
-        # 1️⃣ GOOGLE DOCS (solo si el PDF tiene texto)
-        # ------------------------------------------------
+        # 1️⃣ GOOGLE DOCS
         usar_google = True
-
         if extension == "pdf":
             if not pdf_tiene_texto(temp_path):
-                logger.info("PDF sin texto interno → saltando Google Docs.")
                 usar_google = False
 
         if usar_google:
@@ -187,9 +270,7 @@ def procesar_documento():
             if google_result and google_result["texto"].strip():
                 return jsonify({"status": "success", **google_result}), 200
 
-        # ------------------------------------------------
         # 2️⃣ PDF Converter
-        # ------------------------------------------------
         try:
             pdf_res = pdf_converter.convertir_a_pdf(temp_path, extension)
             if pdf_res:
@@ -199,23 +280,17 @@ def procesar_documento():
         except:
             pass
 
-        # ------------------------------------------------
         # 3️⃣ SIMPLE
-        # ------------------------------------------------
         simple_res = processor.leer_simple(temp_path, extension)
         if simple_res["texto"].strip():
             return jsonify({"status": "success", **simple_res}), 200
 
-        # ------------------------------------------------
         # 4️⃣ LEGACY
-        # ------------------------------------------------
         legacy_res = processor.leer_legacy(temp_path, extension)
         if legacy_res["texto"].strip():
             return jsonify({"status": "success", **legacy_res}), 200
 
-        # ------------------------------------------------
         # 5️⃣ OCR NORMAL
-        # ------------------------------------------------
         ocr_text = legacy_reader.ocr_fallback(temp_path)
 
         if ocr_text.strip():
@@ -226,11 +301,7 @@ def procesar_documento():
                 "warnings": []
             }), 200
 
-        logger.info("OCR normal no extrajo texto → activando OCR agresivo...")
-
-        # ------------------------------------------------
         # 6️⃣ OCR AGRESIVO
-        # ------------------------------------------------
         ocr_text_agresivo = legacy_reader.ocr_agresivo(temp_path)
 
         if ocr_text_agresivo.strip():
@@ -241,9 +312,7 @@ def procesar_documento():
                 "warnings": ["Se usó OCR agresivo por baja calidad del documento"]
             }), 200
 
-        # ------------------------------------------------
         # 7️⃣ NADA FUNCIONÓ
-        # ------------------------------------------------
         return jsonify({
             "status": "success",
             "texto": "",
@@ -255,12 +324,14 @@ def procesar_documento():
         logger.error(f"ERROR GENERAL: {e}")
         return jsonify({"status": "error", "message": "Error interno", "error": str(e)}), 500
 
+
 # ----------------------------------------------------
 # HEALTH CHECK
 # ----------------------------------------------------
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"}), 200
+
 
 # ----------------------------------------------------
 # EJECUCIÓN

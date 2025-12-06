@@ -11,6 +11,7 @@ Compatible con Railway sin LibreOffice
 Compatible con Google Workspace Shared Drive
 ----------------------------------------------------
 INTEGRACIÓN COMPLETA CON GEMINI DESDE BACKEND
+(+ ENDPOINT PARA LISTAR MODELOS DISPONIBLES)
 ----------------------------------------------------
 """
 
@@ -128,7 +129,6 @@ def procesar_con_google(file_path, extension):
 
         texto_google = ""
 
-        # Extraer texto
         for element in doc.get("body", {}).get("content", []):
             if "paragraph" in element:
                 for e in element["paragraph"]["elements"]:
@@ -157,13 +157,18 @@ def procesar_con_google(file_path, extension):
 # ----------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-MODEL = "gemini-1.5-flash-latest"
-ENDPOINT = f"https://generativelanguage.googleapis.com/v1/models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
+# El modelo real se definirá después de listar /ai/models
+DEFAULT_MODEL = "gemini-1.5-flash-latest"   # lo reemplazaremos cuando sepamos cuál existe
 
-def generar_test_con_gemini(texto, num_preguntas):
+def generar_test_con_gemini(texto, num_preguntas, model_name=None):
 
     if not GEMINI_API_KEY:
         return {"error": "GEMINI_API_KEY no configurada en Render"}
+
+    if model_name is None:
+        model_name = DEFAULT_MODEL
+
+    ENDPOINT = f"https://generativelanguage.googleapis.com/v1/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
 
     prompt = f"""
 Genera un examen de {num_preguntas} preguntas basado en este documento:
@@ -219,7 +224,24 @@ Formato JSON:
 
 
 # ----------------------------------------------------
-# 📌 NUEVO ENDPOINT PARA LA APP: /ai/generate
+# 📌 NUEVO ENDPOINT: LISTAR MODELOS DISPONIBLES
+# ----------------------------------------------------
+@app.route('/ai/models', methods=['GET'])
+def listar_modelos():
+    if not GEMINI_API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY no configurada"}), 500
+
+    url = f"https://generativelanguage.googleapis.com/v1/models?key={GEMINI_API_KEY}"
+
+    try:
+        response = requests.get(url)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ----------------------------------------------------
+# 📌 NUEVO ENDPOINT: GENERAR TEST
 # ----------------------------------------------------
 @app.route('/ai/generate', methods=['POST'])
 def generar_examen_ai():
@@ -227,16 +249,18 @@ def generar_examen_ai():
 
     texto = data.get("texto", "")
     num_preguntas = data.get("num_preguntas", 20)
+    modelo = data.get("modelo", None)
 
     if not texto.strip():
         return jsonify({"error": "El campo 'texto' está vacío"}), 400
 
-    resultado = generar_test_con_gemini(texto, num_preguntas)
+    resultado = generar_test_con_gemini(texto, num_preguntas, model_name=modelo)
+
     return jsonify(resultado)
 
 
 # ----------------------------------------------------
-# ENDPOINT PRINCIPAL EXISTENTE (procesar documento)
+# ENDPOINT PRINCIPAL (procesar documento)
 # ----------------------------------------------------
 @app.route('/procesar', methods=['POST'])
 def procesar_documento():
@@ -259,18 +283,15 @@ def procesar_documento():
 
         logger.info(f"Archivo recibido: {filename} ({extension})")
 
-        # 1️⃣ GOOGLE DOCS
         usar_google = True
-        if extension == "pdf":
-            if not pdf_tiene_texto(temp_path):
-                usar_google = False
+        if extension == "pdf" and not pdf_tiene_texto(temp_path):
+            usar_google = False
 
         if usar_google:
             google_result = procesar_con_google(temp_path, extension)
             if google_result and google_result["texto"].strip():
                 return jsonify({"status": "success", **google_result}), 200
 
-        # 2️⃣ PDF Converter
         try:
             pdf_res = pdf_converter.convertir_a_pdf(temp_path, extension)
             if pdf_res:
@@ -280,17 +301,14 @@ def procesar_documento():
         except:
             pass
 
-        # 3️⃣ SIMPLE
         simple_res = processor.leer_simple(temp_path, extension)
         if simple_res["texto"].strip():
             return jsonify({"status": "success", **simple_res}), 200
 
-        # 4️⃣ LEGACY
         legacy_res = processor.leer_legacy(temp_path, extension)
         if legacy_res["texto"].strip():
             return jsonify({"status": "success", **legacy_res}), 200
 
-        # 5️⃣ OCR NORMAL
         ocr_text = legacy_reader.ocr_fallback(temp_path)
 
         if ocr_text.strip():
@@ -301,7 +319,6 @@ def procesar_documento():
                 "warnings": []
             }), 200
 
-        # 6️⃣ OCR AGRESIVO
         ocr_text_agresivo = legacy_reader.ocr_agresivo(temp_path)
 
         if ocr_text_agresivo.strip():
@@ -312,7 +329,6 @@ def procesar_documento():
                 "warnings": ["Se usó OCR agresivo por baja calidad del documento"]
             }), 200
 
-        # 7️⃣ NADA FUNCIONÓ
         return jsonify({
             "status": "success",
             "texto": "",

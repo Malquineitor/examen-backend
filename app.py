@@ -11,7 +11,7 @@ Compatible con Railway sin LibreOffice
 Compatible con Google Workspace Shared Drive
 ----------------------------------------------------
 INTEGRACIÓN COMPLETA CON GEMINI DESDE BACKEND
-(+ ENDPOINT PARA LISTAR MODELOS DISPONIBLES)
+(Modelo: gemini-2.0-flash-lite → modo barato/casi gratis)
 ----------------------------------------------------
 """
 
@@ -23,7 +23,7 @@ import os
 import tempfile
 import json
 import logging
-import requests   # <--- NECESARIO PARA LLAMAR A GEMINI
+import requests   # Para llamar a Gemini API
 
 # Procesadores
 from document_processor import DocumentProcessor
@@ -91,74 +91,11 @@ else:
     logger.warning("No se encontraron credenciales Google.")
 
 # ----------------------------------------------------
-# PROCESAR CON GOOGLE DOCS
-# ----------------------------------------------------
-def procesar_con_google(file_path, extension):
-    if google_credentials is None:
-        return None
-
-    try:
-        drive = build("drive", "v3", credentials=google_credentials)
-        docs = build("docs", "v1", credentials=google_credentials)
-
-        file_metadata = {
-            "name": f"temp.{extension}",
-            "parents": [SHARED_DRIVE_ID]
-        }
-        media = MediaFileUpload(file_path, resumable=False)
-
-        subida = drive.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id",
-            supportsAllDrives=True
-        ).execute()
-
-        file_id = subida["id"]
-        logger.info(f"Archivo subido a unidad compartida: {file_id}")
-
-        try:
-            doc = docs.documents().get(documentId=file_id).execute()
-        except Exception as e:
-            logger.error(f"Google Docs no pudo abrir el archivo: {e}")
-            try:
-                drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
-            except:
-                pass
-            return None
-
-        texto_google = ""
-
-        for element in doc.get("body", {}).get("content", []):
-            if "paragraph" in element:
-                for e in element["paragraph"]["elements"]:
-                    texto_google += e.get("textRun", {}).get("content", "")
-
-        try:
-            drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
-        except:
-            pass
-
-        if texto_google.strip():
-            return {
-                "texto": texto_google,
-                "method": "google",
-                "warnings": []
-            }
-
-    except Exception as e:
-        logger.error(f"[GOOGLE ERROR] {e}")
-
-    return None
-
-
-# ----------------------------------------------------
-# 🔥🔥🔥 GEMINI DESDE BACKEND – NUEVA FUNCIÓN
+# ✨ GEMINI DESDE BACKEND – MODELO GRATIS (2.0 FLASH-LITE)
 # ----------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# El modelo real se definirá después de listar /ai/models
-DEFAULT_MODEL = "gemini-1.5-flash-latest"   # lo reemplazaremos cuando sepamos cuál existe
+DEFAULT_MODEL = "models/gemini-2.0-flash-lite"  # ✔ modelo barato y disponible
 
 def generar_test_con_gemini(texto, num_preguntas, model_name=None):
 
@@ -168,7 +105,10 @@ def generar_test_con_gemini(texto, num_preguntas, model_name=None):
     if model_name is None:
         model_name = DEFAULT_MODEL
 
-    ENDPOINT = f"https://generativelanguage.googleapis.com/v1/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+    ENDPOINT = (
+        f"https://generativelanguage.googleapis.com/v1/models/"
+        f"{model_name}:generateContent?key={GEMINI_API_KEY}"
+    )
 
     prompt = f"""
 Genera un examen de {num_preguntas} preguntas basado en este documento:
@@ -222,9 +162,8 @@ Formato JSON:
         "text": texto_generado
     }
 
-
 # ----------------------------------------------------
-# 📌 NUEVO ENDPOINT: LISTAR MODELOS DISPONIBLES
+# 📌 ENDPOINT: LISTAR MODELOS DISPONIBLES
 # ----------------------------------------------------
 @app.route('/ai/models', methods=['GET'])
 def listar_modelos():
@@ -239,9 +178,8 @@ def listar_modelos():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # ----------------------------------------------------
-# 📌 NUEVO ENDPOINT: GENERAR TEST
+# 📌 ENDPOINT: GENERAR TEST CON IA
 # ----------------------------------------------------
 @app.route('/ai/generate', methods=['POST'])
 def generar_examen_ai():
@@ -255,9 +193,7 @@ def generar_examen_ai():
         return jsonify({"error": "El campo 'texto' está vacío"}), 400
 
     resultado = generar_test_con_gemini(texto, num_preguntas, model_name=modelo)
-
     return jsonify(resultado)
-
 
 # ----------------------------------------------------
 # ENDPOINT PRINCIPAL (procesar documento)
@@ -283,6 +219,7 @@ def procesar_documento():
 
         logger.info(f"Archivo recibido: {filename} ({extension})")
 
+        # 1️⃣ GOOGLE DOCS
         usar_google = True
         if extension == "pdf" and not pdf_tiene_texto(temp_path):
             usar_google = False
@@ -292,6 +229,7 @@ def procesar_documento():
             if google_result and google_result["texto"].strip():
                 return jsonify({"status": "success", **google_result}), 200
 
+        # 2️⃣ PDF Converter
         try:
             pdf_res = pdf_converter.convertir_a_pdf(temp_path, extension)
             if pdf_res:
@@ -301,14 +239,17 @@ def procesar_documento():
         except:
             pass
 
+        # 3️⃣ SIMPLE
         simple_res = processor.leer_simple(temp_path, extension)
         if simple_res["texto"].strip():
             return jsonify({"status": "success", **simple_res}), 200
 
+        # 4️⃣ LEGACY
         legacy_res = processor.leer_legacy(temp_path, extension)
         if legacy_res["texto"].strip():
             return jsonify({"status": "success", **legacy_res}), 200
 
+        # 5️⃣ OCR NORMAL
         ocr_text = legacy_reader.ocr_fallback(temp_path)
 
         if ocr_text.strip():
@@ -319,6 +260,7 @@ def procesar_documento():
                 "warnings": []
             }), 200
 
+        # 6️⃣ OCR AGRESIVO
         ocr_text_agresivo = legacy_reader.ocr_agresivo(temp_path)
 
         if ocr_text_agresivo.strip():
@@ -326,9 +268,10 @@ def procesar_documento():
                 "status": "success",
                 "texto": ocr_text_agresivo,
                 "method": "ocr_aggressive",
-                "warnings": ["Se usó OCR agresivo por baja calidad del documento"]
+                "warnings": ["Se usó OCR agresivo por baja calidad"]
             }), 200
 
+        # 7️⃣ NADA FUNCIONÓ
         return jsonify({
             "status": "success",
             "texto": "",
@@ -340,14 +283,12 @@ def procesar_documento():
         logger.error(f"ERROR GENERAL: {e}")
         return jsonify({"status": "error", "message": "Error interno", "error": str(e)}), 500
 
-
 # ----------------------------------------------------
 # HEALTH CHECK
 # ----------------------------------------------------
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"}), 200
-
 
 # ----------------------------------------------------
 # EJECUCIÓN

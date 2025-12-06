@@ -1,33 +1,36 @@
 """
-ai_service.py – Versión 2025
+ai_service.py – Versión COMPLETA (2025)
 -------------------------------------
-Reemplaza 100% la lógica que antes vivía en la app Android:
- - Construcción avanzada de prompts
- - División en bloques (ahora viene desde document_processor)
- - Reintentos automáticos
- - Limpieza de la respuesta
- - Extracción estricta del JSON
- - Generación múltiple por bloque
--------------------------------------
-Compatible con Gemini 2.0 / 2.5 / Flash-Lite
+Replica EXACTAMENTE la lógica de generación de tests de la app Android:
+
+✔ Construcción avanzada de prompts
+✔ Limpieza profunda del texto
+✔ Corrección de JSON incompleto
+✔ Extracción estable del array JSON
+✔ Reordenar alternativas aleatoriamente
+✔ Normalización de campos
+✔ Reintentos con tolerancia a errores
+✔ Manejo de modelos Gemini 2.0 / 2.5 / Flash-Lite
 """
 
 import os
-import requests
 import json
-import time
 import re
+import time
+import random
+import requests
+
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 DEFAULT_MODEL = "gemini-2.0-flash-lite"
 
-# ==============================================
-# 🔹 LLAMAR A GEMINI CON RETRY Y MANEJO DE ERRORES
-# ==============================================
+
+# ======================================================
+# 🔥 1. LLAMAR A GEMINI CON REINTENTOS
+# ======================================================
 def call_gemini(prompt: str, model_name: str = DEFAULT_MODEL, retries: int = 2):
     if not GEMINI_API_KEY:
-        raise Exception("GEMINI_API_KEY no está configurada en Render/Railway")
+        raise Exception("GEMINI_API_KEY no configurada")
 
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -40,38 +43,39 @@ def call_gemini(prompt: str, model_name: str = DEFAULT_MODEL, retries: int = 2):
         ]
     }
 
-    for attempt in range(retries):
+    for intento in range(retries):
         try:
             r = requests.post(endpoint, json=payload, timeout=60)
             data = r.json()
 
             if r.status_code == 200:
-                # Extraer texto con seguridad
                 try:
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    return text
+                    if text:
+                        return text
                 except:
                     pass
 
         except Exception as e:
-            print(f"[Gemini ERROR] Attempt {attempt+1} → {e}")
+            print(f"[Gemini Error] Intento {intento+1}: {e}")
 
-        time.sleep(1.2)
+        time.sleep(1.1)
 
     return None
 
 
-# ==============================================
-# 🔹 LIMPIAR RESPUESTA Y EXTRAER SOLO EL JSON
-# ==============================================
+# ======================================================
+# 🔥 2. LIMPIAR RESPUESTA Y EXTRAER SOLO EL JSON
+# ======================================================
 def extract_clean_json(text):
     if not text:
         return "[]"
 
-    # Eliminar código markdown
+    # Remove markdown
     text = text.replace("```json", "").replace("```", "")
+    text = text.strip()
 
-    # Buscar array [
+    # Search for JSON array
     start = text.find("[")
     end = text.rfind("]")
 
@@ -81,68 +85,142 @@ def extract_clean_json(text):
     return text[start:end+1]
 
 
-# ==============================================
-# 🔹 PROMPT EXACTO COMO EL DE LA APP ANDROID
-# ==============================================
-def build_prompt(block_text, block_num, total_blocks, questions_goal):
+# ======================================================
+# 🔥 3. CORREGIR JSON INCOMPLETO
+# ======================================================
+def fix_json(json_text):
+    """
+    Igual que en la app: intenta reparar JSON parcial
+    """
+    # Remove emojis
+    json_text = re.sub(r"[\U00010000-\U0010ffff]", "", json_text)
+
+    # Fix missing closing brackets
+    opens = json_text.count("[")
+    closes = json_text.count("]")
+    if closes < opens:
+        json_text += "]" * (opens - closes)
+
+    return json_text
+
+
+# ======================================================
+# 🔥 4. NORMALIZAR CAMPOS (igual a la app)
+# ======================================================
+def normalize_question(raw):
+    """
+    Acepta variantes: pregunta/texto, alternativas/opciones, correcta/resp_correcta
+    """
+    texto = raw.get("texto") or raw.get("pregunta") or ""
+    alternativas = raw.get("alternativas") or raw.get("opciones") or []
+    correcta = raw.get("correcta") or raw.get("respuesta_correcta") or ""
+
+    if not texto or not alternativas or not correcta:
+        return None
+
+    return {
+        "texto": texto.strip(),
+        "alternativas": alternativas,
+        "correcta": correcta.lower()
+    }
+
+
+# ======================================================
+# 🔥 5. REORDENAR ALTERNATIVAS (igual que Android)
+# ======================================================
+def shuffle_alternatives(question):
+    opciones = question["alternativas"]
+    correcta = question["correcta"]
+
+    # Identificar texto correcto
+    texto_correcto = None
+    for opt in opciones:
+        if opt.lower().startswith(correcta):
+            texto_correcto = opt
+            break
+
+    random.shuffle(opciones)
+
+    nueva_correcta = None
+    for opt in opciones:
+        if opt == texto_correcto:
+            letra = opt.split(")")[0].lower()
+            nueva_correcta = letra
+
+    question["alternativas"] = opciones
+    question["correcta"] = nueva_correcta
+
+    return question
+
+
+# ======================================================
+# 🔥 6. CONSTRUIR PROMPT COMPLETO
+# ======================================================
+def build_prompt(bloque, num, total, preguntas):
     return f"""
-Eres un generador de preguntas tipo test. Tu tarea es crear preguntas basadas únicamente en el siguiente bloque de texto.
+Eres un generador de preguntas tipo test. 
+Tu tarea es crear preguntas basadas únicamente en el siguiente bloque de texto.
 
 CONTEXTO:
-- Este es el bloque {block_num} de {total_blocks} bloques totales.
-- Evita repetir información generada en bloques anteriores.
+- Este es el bloque {num} de {total}.
+- Evita repetir información generada anteriormente.
 
 INSTRUCCIONES CRÍTICAS:
-1. Genera al menos {questions_goal} preguntas (más si el contenido lo permite).
-2. Cada pregunta debe tener EXACTAMENTE 4 alternativas (a, b, c, d).
-3. Solo UNA alternativa es correcta.
-4. Analiza TODO el contenido y crea preguntas sobre CADA concepto relevante.
-5. Crea preguntas variadas: definición, comprensión, aplicación, análisis.
-6. NO agregues texto explicativo antes o después del JSON.
-7. Devuelve ÚNICAMENTE el array JSON, sin markdown, sin explicaciones.
+1. Genera al menos {preguntas} preguntas.
+2. EXACTAMENTE 4 alternativas: a, b, c, d.
+3. Solo UNA alternativa correcta.
+4. No inventes datos.
+5. NO agregues texto fuera del JSON.
+6. SOLO devuelve el ARRAY JSON.
 
-FORMATO JSON CORRECTO:
+FORMATO:
 [
   {{
-    "texto": "¿Ejemplo de pregunta?",
-    "alternativas": ["a) A", "b) B", "c) C", "d) D"],
-    "correcta": "c"
+    "texto": "",
+    "alternativas": ["a) ...", "b) ...", "c) ...", "d) ..."],
+    "correcta": "b"
   }}
 ]
 
-NO INCLUYAS NINGÚN TEXTO FUERA DEL JSON.
-
-BLOQUE A PROCESAR:
-{block_text}
+BLOQUE:
+{bloque}
 """.strip()
 
 
-# ==============================================
-# 🔹 FUNCIÓN PRINCIPAL PARA GENERAR PREGUNTAS
-# ==============================================
+# ======================================================
+# 🔥 7. GENERAR PREGUNTAS POR BLOQUE
+# ======================================================
 def generar_preguntas_por_bloque(block_text, block_num, total_blocks, questions_goal, model=DEFAULT_MODEL):
+
     prompt = build_prompt(block_text, block_num, total_blocks, questions_goal)
+    raw = call_gemini(prompt, model_name=model)
 
-    raw_response = call_gemini(prompt, model_name=model)
-
-    if not raw_response:
+    if not raw:
         return []
 
-    clean_json = extract_clean_json(raw_response)
+    clean = extract_clean_json(raw)
+    fixed = fix_json(clean)
 
     try:
-        arr = json.loads(clean_json)
-        return arr
+        arr = json.loads(fixed)
     except:
         return []
 
+    final = []
+    for q in arr:
+        qn = normalize_question(q)
+        if qn:
+            qn = shuffle_alternatives(qn)
+            final.append(qn)
 
-# ==============================================
-# 🔹 GENERADOR COMPLETO (USADO POR app.py)
-# ==============================================
+    return final
+
+
+# ======================================================
+# 🔥 8. GENERAR EXAMEN COMPLETO (para app.py)
+# ======================================================
 def generar_examen(texto, bloques, preguntas_por_bloque, modelo=DEFAULT_MODEL):
-
-    todas = []
+    todo = []
 
     for i, bloque in enumerate(bloques, start=1):
         preguntas = generar_preguntas_por_bloque(
@@ -153,6 +231,6 @@ def generar_examen(texto, bloques, preguntas_por_bloque, modelo=DEFAULT_MODEL):
             model=modelo
         )
 
-        todas.extend(preguntas)
+        todo.extend(preguntas)
 
-    return todas
+    return todo
